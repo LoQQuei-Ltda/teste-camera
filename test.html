@@ -1,0 +1,188 @@
+<!doctype html>
+<html lang="pt-br">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Leitor de QR Code</title>
+  <style>
+    :root { --bg:#0b0f14; --fg:#e6edf3; --card:#111827; --line:#1f2937; }
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Ubuntu, Cantarell, 'Helvetica Neue', Arial, 'Noto Sans'; margin: 0; padding: 16px; background: var(--bg); color: var(--fg); }
+    .card { max-width: 820px; margin: 0 auto; background: var(--card); border: 1px solid var(--line); border-radius: 16px; padding: 16px; }
+    h1 { font-size: 1.15rem; margin: 0 0 12px; }
+    .row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin: 8px 0 12px; }
+    button { background: #0b1220; color: var(--fg); border: 1px solid #263245; border-radius: 10px; padding: 10px 14px; font-size: 1rem; cursor: pointer; }
+    button:disabled { opacity: .6; cursor: not-allowed; }
+    .hint { font-size: .9rem; opacity: .95; }
+    video { width: 100%; aspect-ratio: 16/9; background: #000; border-radius: 12px; border: 1px solid #263245; }
+    #result { margin-top: 10px; padding: 10px; background: #0b1220; border: 1px solid #263245; border-radius: 10px; word-break: break-word; }
+    #result a { color: #8ab4ff; }
+  </style>
+  <!-- Fallback lib (usada se BarcodeDetector não existir) -->
+  <script defer src="https://cdn.jsdelivr.net/npm/jsqr@1.4.0/dist/jsQR.js"></script>
+</head>
+<body>
+  <div class="card">
+    <h1>Leitor de QR Code</h1>
+
+    <div class="row">
+      <button id="startBtn">📷 Abrir câmera</button>
+      <button id="stopBtn" disabled>✋ Parar</button>
+    </div>
+
+    <div class="hint" id="envHint"></div>
+
+    <video id="video" autoplay playsinline muted></video>
+    <canvas id="canvas" hidden></canvas>
+
+    <div id="status" class="hint">Aguardando você tocar em "Abrir câmera"…</div>
+    <div id="result" hidden></div>
+  </div>
+
+  <script>
+    // Elementos
+    const startBtn = document.getElementById('startBtn');
+    const stopBtn  = document.getElementById('stopBtn');
+    const video    = document.getElementById('video');
+    const canvas   = document.getElementById('canvas');
+    const statusEl = document.getElementById('status');
+    const resultEl = document.getElementById('result');
+    const envHint  = document.getElementById('envHint');
+    const ctx = canvas.getContext('2d', { willReadFrequently: true });
+
+    let stream = null;
+    let rafId = null;
+    let lastText = null;
+    let detector = null;
+
+    // 1) Verificações de ambiente que impactam o prompt de permissão
+    (function environmentChecks(){
+      const isHttps = location.protocol === 'https:' || location.hostname === 'localhost' || location.hostname === '127.0.0.1';
+      const ua = navigator.userAgent;
+      const isChrome = /Chrome\//.test(ua) && !/Edg\//.test(ua) && !/OPR\//.test(ua);
+      envHint.innerHTML = `${isHttps ? '✅' : '⚠️'} Esta página ${isHttps ? 'está em origem segura (HTTPS/localhost)' : 'precisa estar em HTTPS ou localhost para a câmera funcionar.'} ${isChrome ? '' : ''}`;
+    })();
+
+    // 2) Permissões — alguns Chrome no Android só mostram o prompt após gesto do usuário
+    async function reportPermissionState(){
+      if (!('permissions' in navigator)) return;
+      try {
+        const perm = await navigator.permissions.query({ name: 'camera' });
+        statusEl.textContent = `Permissão da câmera: ${perm.state}. Toque em "Abrir câmera" para solicitar.`;
+        perm.onchange = () => statusEl.textContent = `Permissão da câmera: ${perm.state}.`;
+      } catch { /* nem todo ambiente implementa */ }
+    }
+
+    // 3) Detector nativo (se disponível)
+    function hasBarcodeDetector(){
+      return 'BarcodeDetector' in window && typeof window.BarcodeDetector === 'function';
+    }
+    function initDetector(){
+      if (hasBarcodeDetector()) {
+        try { detector = new BarcodeDetector({ formats: ['qr_code'] }); } catch { detector = null; }
+      }
+    }
+
+    // 4) Controle de câmera
+    async function startCamera(){
+      stopCamera(); // limpa estado anterior
+      statusEl.textContent = 'Solicitando acesso à câmera…';
+      try {
+        // IMPORTANTE: chamar em resposta a um gesto do usuário (clique no botão)
+        const constraints = { video: { facingMode: { ideal: 'environment' } } };
+        stream = await navigator.mediaDevices.getUserMedia(constraints);
+        video.srcObject = stream;
+        await video.play();
+        canvas.width = video.videoWidth || 1280;
+        canvas.height = video.videoHeight || 720;
+        startBtn.disabled = true;
+        stopBtn.disabled = false;
+        statusEl.textContent = 'Câmera ativa. Procurando QR…';
+        beginScanning();
+      } catch (err) {
+        console.error(err);
+        // Mensagens de erro mais claras por tipo
+        const name = err && err.name || '';
+        const map = {
+          NotAllowedError: 'Permissão negada. Vá em Configurações do site → Câmera e permita o acesso.',
+          NotFoundError: 'Nenhuma câmera foi encontrada neste dispositivo.',
+          NotReadableError: 'A câmera está em uso por outro app/aba.',
+          OverconstrainedError: 'As restrições de vídeo não puderam ser atendidas.',
+          SecurityError: 'Origem não segura (precisa HTTPS/localhost).',
+          AbortError: 'Falha temporária ao acessar a câmera.'
+        };
+        statusEl.textContent = map[name] || `Erro ao acessar a câmera: ${name || err.message}`;
+      }
+    }
+
+    function stopCamera(){
+      if (rafId) cancelAnimationFrame(rafId);
+      if (stream) { stream.getTracks().forEach(t => t.stop()); stream = null; }
+      startBtn.disabled = false;
+      stopBtn.disabled = true;
+      statusEl.textContent = 'Câmera parada.';
+    }
+
+    // 5) Leitura (BarcodeDetector → fallback jsQR)
+    function beginScanning(){
+      if (detector) {
+        const tick = async () => {
+          try {
+            const codes = await detector.detect(video);
+            if (codes && codes.length) {
+              const text = codes[0].rawValue || codes[0].value;
+              if (text && text !== lastText) showResult(text);
+            }
+            statusEl.textContent = 'Procurando QR…';
+          } catch (e) {
+            console.warn('Detector falhou, usando jsQR:', e); detector = null; return startJsQR();
+          }
+          rafId = requestAnimationFrame(tick);
+        }; tick();
+      } else {
+        startJsQR();
+      }
+    }
+
+    function startJsQR(){
+      const loop = () => {
+        if (!stream) return;
+        const w = video.videoWidth, h = video.videoHeight;
+        if (w && h) {
+          canvas.width = w; canvas.height = h;
+          ctx.drawImage(video, 0, 0, w, h);
+          const img = ctx.getImageData(0, 0, w, h);
+          if (window.jsQR) {
+            const qr = jsQR(img.data, img.width, img.height, { inversionAttempts: 'dontInvert' });
+            if (qr && qr.data && qr.data !== lastText) showResult(qr.data);
+          }
+          statusEl.textContent = 'Procurando QR…';
+        }
+        rafId = requestAnimationFrame(loop);
+      }; loop();
+    }
+
+    function showResult(text){
+      lastText = text;
+      resultEl.hidden = false;
+      try { const u = new URL(text); resultEl.innerHTML = `QR lido: <a href="${u.href}" target="_blank" rel="noopener">${u.href}</a>`; }
+      catch { resultEl.textContent = `QR lido: ${text}`; }
+      statusEl.textContent = 'QR encontrado ✅';
+    }
+
+    // Eventos
+    startBtn.addEventListener('click', startCamera, { passive: true });
+    stopBtn.addEventListener('click', stopCamera, { passive: true });
+    document.addEventListener('visibilitychange', () => { if (document.hidden) stopCamera(); });
+
+    // Inicialização
+    (function init(){
+      if (!navigator.mediaDevices?.getUserMedia) {
+        statusEl.textContent = 'Este navegador não expõe getUserMedia. Atualize o Chrome ou use HTTPS.';
+        startBtn.disabled = true; return;
+      }
+      initDetector();
+      reportPermissionState();
+    })();
+  </script>
+</body>
+</html>
